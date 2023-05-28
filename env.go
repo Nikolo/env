@@ -15,7 +15,7 @@ import (
 
 // nolint: gochecknoglobals
 var (
-	defaultBuiltInUnmarshal = map[reflect.Kind]ParserFunc{
+	defaultBuiltInParsers = map[reflect.Kind]ParserFunc{
 		reflect.Bool: func(v string) (interface{}, error) {
 			return strconv.ParseBool(v)
 		},
@@ -614,7 +614,7 @@ func set(field reflect.Value, sf reflect.StructField, value string, funcMap map[
 		return nil
 	}
 
-	parserFunc, ok = defaultBuiltInUnmarshal[typee.Kind()]
+	parserFunc, ok = defaultBuiltInParsers[typee.Kind()]
 	if ok {
 		val, err := parserFunc(value)
 		if err != nil {
@@ -676,7 +676,7 @@ func handleSlice(field reflect.Value, value string, sf reflect.StructField, func
 
 	parserFunc, ok := funcMap[typee]
 	if !ok {
-		parserFunc, ok = defaultBuiltInUnmarshal[typee.Kind()]
+		parserFunc, ok = defaultBuiltInParsers[typee.Kind()]
 		if !ok {
 			return newNoParserError(sf)
 		}
@@ -725,7 +725,7 @@ func handleMap(field reflect.Value, value string, sf reflect.StructField, funcMa
 	keyType := sf.Type.Key()
 	keyParserFunc, ok := funcMap[keyType]
 	if !ok {
-		keyParserFunc, ok = defaultBuiltInUnmarshal[keyType.Kind()]
+		keyParserFunc, ok = defaultBuiltInParsers[keyType.Kind()]
 		if !ok {
 			return newNoParserError(sf)
 		}
@@ -734,7 +734,7 @@ func handleMap(field reflect.Value, value string, sf reflect.StructField, funcMa
 	elemType := sf.Type.Elem()
 	elemParserFunc, ok := funcMap[elemType]
 	if !ok {
-		elemParserFunc, ok = defaultBuiltInUnmarshal[elemType.Kind()]
+		elemParserFunc, ok = defaultBuiltInParsers[elemType.Kind()]
 		if !ok {
 			return newNoParserError(sf)
 		}
