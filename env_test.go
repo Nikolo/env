@@ -11,9 +11,45 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func newTestCollector() *testCollector {
+	return &testCollector{
+		Map: map[string][]EnvField{},
+	}
+}
+
+type testCollector struct {
+	Map map[string][]EnvField
+	sync.Mutex
+}
+
+func (c *testCollector) AddCodeValue(key string, isPtr bool, val string) {
+	c.Lock()
+	defer c.Unlock()
+
+	cm, ex := c.Map[key]
+	if !ex {
+		panic("can't add codeValue for unexistings env: " + key)
+	}
+
+	cm[len(cm)-1].CodeValue = val
+	cm[len(cm)-1].IsPtr = isPtr
+}
+
+func (c *testCollector) Set(key string, envF EnvField) {
+	c.Lock()
+	defer c.Unlock()
+
+	if _, ex := c.Map[key]; !ex {
+		c.Map[key] = []EnvField{}
+	}
+
+	c.Map[key] = append(c.Map[key], envF)
+}
 
 type unmarshaler struct {
 	time.Duration
@@ -161,6 +197,13 @@ func TestIssue245(t *testing.T) {
 	cfg := user{}
 	isNoErr(t, Parse(&cfg))
 	isEqual(t, cfg.Name, "abcd")
+
+	cfg1 := user{}
+	tc := newTestCollector()
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+	tcs, ex := tc.Map["NAME_NOT_SET"]
+	isEqual(t, ex, true)
+	isEqual(t, tcs[0].Default, "abcd")
 }
 
 func TestParsesEnv(t *testing.T) {
@@ -399,6 +442,29 @@ func TestParsesEnv(t *testing.T) {
 	isEqual(t, cfg.NotAnEnv, "")
 
 	isEqual(t, cfg.unexported, "")
+
+	cfg1 := Config{
+		Strings: []string{"a", "b"},
+	}
+	tc := newTestCollector()
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+
+	isEqual(t, str1, tc.Map["STRING"][0].EnvValue)
+	isEqual(t, true, tc.Map["STRING"][1].IsPtr)
+	isEqual(t, strings.Join([]string{str1, str2}, ","), tc.Map["STRINGS"][0].EnvValue)
+	isEqual(t, "a,b", tc.Map["STRINGS"][0].CodeValue)
+	isEqual(t, str2, cfg.Strings[1])
+	isEqual(t, true, tc.Map["STRINGS"][1].IsPtr)
+
+	isEqual(t, url1, tc.Map["URL"][0].EnvValue)
+	isEqual(t, true, tc.Map["URL"][1].IsPtr)
+
+	isEqual(t, "postgres://localhost:5432/db", tc.Map["DATABASE_URL"][0].Default)
+
+	isEqual(t, strings.Join([]string{str1, str2}, ":"), tc.Map["SEPSTRINGS"][0].EnvValue)
+	isEqual(t, ":", tc.Map["SEPSTRINGS"][0].Separator)
+
+	isEqual(t, 0, len(tc.Map["FOO"]))
 }
 
 func TestParsesEnv_Map(t *testing.T) {
@@ -432,6 +498,15 @@ func TestParsesEnv_Map(t *testing.T) {
 	isEqual(t, mss, cfg.MapStringString)
 	isEqual(t, msi, cfg.MapStringInt64)
 	isEqual(t, msb, cfg.MapStringBool)
+
+	cfg1 := config{
+		MapStringInt64: map[string]int64{"k": 12},
+	}
+	tc := newTestCollector()
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+
+	isEqual(t, "k1:true;k2:false", tc.Map["MAP_STRING_BOOL"][0].EnvValue)
+	isEqual(t, "k:12", tc.Map["MAP_STRING_INT64"][0].CodeValue)
 }
 
 func TestParsesEnvInvalidMap(t *testing.T) {
@@ -444,6 +519,13 @@ func TestParsesEnvInvalidMap(t *testing.T) {
 	var cfg config
 	err := Parse(&cfg)
 	isTrue(t, errors.Is(err, ParseError{}))
+
+	cfg1 := config{}
+	tc := newTestCollector()
+
+	err = ParseWithOptions(&cfg1, Options{Collector: tc})
+	isTrue(t, errors.Is(err, ParseError{}))
+	isEqual(t, 1, len(tc.Map["MAP_STRING_STRING"]))
 }
 
 func TestParseCustomMapType(t *testing.T) {
@@ -455,12 +537,24 @@ func TestParseCustomMapType(t *testing.T) {
 
 	t.Setenv("SECRET_KEY", "somesecretkey:1")
 
-	var cfg config
-	isNoErr(t, ParseWithOptions(&cfg, Options{FuncMap: map[reflect.Type]ParserFunc{
+	opts := Options{FuncMap: map[reflect.Type]ParserFunc{
 		reflect.TypeOf(custommap{}): func(value string) (interface{}, error) {
 			return custommap(map[string]bool{}), nil
 		},
-	}}))
+	}}
+
+	var cfg config
+
+	isNoErr(t, ParseWithOptions(&cfg, opts))
+
+	var cfg1 config
+
+	tc := newTestCollector()
+	opts.Collector = tc
+
+	isNoErr(t, ParseWithOptions(&cfg1, opts))
+	isEqual(t, 1, len(tc.Map["SECRET_KEY"]))
+	isEqual(t, "", tc.Map["SECRET_KEY"][0].CodeValue)
 }
 
 func TestParseMapCustomKeyType(t *testing.T) {
@@ -472,12 +566,26 @@ func TestParseMapCustomKeyType(t *testing.T) {
 
 	t.Setenv("SECRET", "somesecretkey:1")
 
-	var cfg config
-	isNoErr(t, ParseWithOptions(&cfg, Options{FuncMap: map[reflect.Type]ParserFunc{
+	opts := Options{FuncMap: map[reflect.Type]ParserFunc{
 		reflect.TypeOf(CustomKey("")): func(value string) (interface{}, error) {
 			return CustomKey(value), nil
 		},
-	}}))
+	}}
+
+	var cfg config
+	isNoErr(t, ParseWithOptions(&cfg, opts))
+
+	cfg1 := config{
+		SecretKey: map[CustomKey]bool{"foo": true},
+	}
+
+	tc := newTestCollector()
+	opts.Collector = tc
+
+	isNoErr(t, ParseWithOptions(&cfg1, opts))
+	isEqual(t, 1, len(tc.Map["SECRET"]))
+	isEqual(t, "foo:true", tc.Map["SECRET"][0].CodeValue)
+
 }
 
 func TestParseMapCustomKeyNoParser(t *testing.T) {
@@ -492,6 +600,15 @@ func TestParseMapCustomKeyNoParser(t *testing.T) {
 	var cfg config
 	err := Parse(&cfg)
 	isTrue(t, errors.Is(err, NoParserError{}))
+
+	cfg1 := config{
+		SecretKey: map[CustomKey]bool{struct{}{}: true},
+	}
+
+	tc := newTestCollector()
+	err = ParseWithOptions(&cfg1, Options{Collector: tc})
+	isTrue(t, errors.Is(err, NoParserError{}))
+	isTrue(t, strings.HasPrefix(tc.Map["SECRET"][0].CodeValue, "can't makeEnv"))
 }
 
 func TestParseMapCustomValueNoParser(t *testing.T) {
@@ -506,6 +623,16 @@ func TestParseMapCustomValueNoParser(t *testing.T) {
 	var cfg config
 	err := Parse(&cfg)
 	isTrue(t, errors.Is(err, NoParserError{}))
+
+	cfg1 := config{
+		SecretKey: map[string]Customval{"foo": struct{}{}},
+	}
+
+	tc := newTestCollector()
+	err = ParseWithOptions(&cfg1, Options{Collector: tc})
+	isTrue(t, errors.Is(err, NoParserError{}))
+	fmt.Printf("%+v\n", tc.Map["SECRET"][0].CodeValue)
+	isTrue(t, strings.Contains(tc.Map["SECRET"][0].CodeValue, "can't makeEnv"))
 }
 
 func TestParseMapCustomKeyTypeError(t *testing.T) {
@@ -526,6 +653,38 @@ func TestParseMapCustomKeyTypeError(t *testing.T) {
 	isTrue(t, errors.Is(err, ParseError{}))
 }
 
+func TestParseMapCustomKeyTypeFormatError(t *testing.T) {
+	type CustomKey string
+
+	type config struct {
+		SecretKey map[CustomKey]bool `env:"SECRET"`
+	}
+
+	t.Setenv("SECRET", "somesecretkey:1")
+
+	cfg := config{
+		SecretKey: map[CustomKey]bool{"foo": true},
+	}
+
+	tc := newTestCollector()
+
+	err := ParseWithOptions(&cfg, Options{
+		Collector: tc,
+		FuncMap: map[reflect.Type]ParserFunc{
+			reflect.TypeOf(CustomKey("")): func(value string) (interface{}, error) {
+				return nil, fmt.Errorf("custom error")
+			},
+		},
+		FormatMap: map[reflect.Type]FormatFunc{
+			reflect.TypeOf(CustomKey("")): func(i reflect.Value) (string, error) {
+				return "", fmt.Errorf("custom format error")
+			},
+		},
+	})
+	isTrue(t, errors.Is(err, ParseError{}))
+	isTrue(t, strings.Contains(err.Error(), "custom format error"))
+}
+
 func TestParseMapCustomValueTypeError(t *testing.T) {
 	type Customval string
 
@@ -544,6 +703,38 @@ func TestParseMapCustomValueTypeError(t *testing.T) {
 	isTrue(t, errors.Is(err, ParseError{}))
 }
 
+func TestParseMapCustomValueTypeFormatError(t *testing.T) {
+	type Customval string
+
+	type config struct {
+		SecretKey map[string]Customval `env:"SECRET"`
+	}
+
+	t.Setenv("SECRET", "somesecretkey:1")
+
+	cfg := config{
+		SecretKey: map[string]Customval{"foo": "true"},
+	}
+
+	tc := newTestCollector()
+
+	err := ParseWithOptions(&cfg, Options{
+		Collector: tc,
+		FuncMap: map[reflect.Type]ParserFunc{
+			reflect.TypeOf(Customval("")): func(value string) (interface{}, error) {
+				return nil, fmt.Errorf("custom error")
+			},
+		},
+		FormatMap: map[reflect.Type]FormatFunc{
+			reflect.TypeOf(Customval("")): func(i reflect.Value) (string, error) {
+				return "", fmt.Errorf("custom format error")
+			},
+		},
+	})
+	isTrue(t, errors.Is(err, ParseError{}))
+	isTrue(t, strings.Contains(err.Error(), "custom format error"))
+}
+
 func TestSetenvAndTagOptsChain(t *testing.T) {
 	type config struct {
 		Key1 string `mytag:"KEY1,required"`
@@ -558,6 +749,15 @@ func TestSetenvAndTagOptsChain(t *testing.T) {
 	isNoErr(t, ParseWithOptions(&cfg, Options{TagName: "mytag", Environment: envs}))
 	isEqual(t, "VALUE1", cfg.Key1)
 	isEqual(t, 3, cfg.Key2)
+
+	cfg1 := config{
+		Key1: "CODE",
+	}
+	tc := newTestCollector()
+
+	isNoErr(t, ParseWithOptions(&cfg1, Options{TagName: "mytag", Environment: envs, Collector: tc}))
+	isEqual(t, "VALUE1", tc.Map["KEY1"][0].EnvValue)
+	isEqual(t, "CODE", tc.Map["KEY1"][0].CodeValue)
 }
 
 func TestJSONTag(t *testing.T) {
@@ -573,6 +773,15 @@ func TestJSONTag(t *testing.T) {
 	isNoErr(t, ParseWithOptions(&cfg, Options{TagName: "json"}))
 	isEqual(t, "VALUE7", cfg.Key1)
 	isEqual(t, 5, cfg.Key2)
+
+	cfg1 := config{
+		Key1: "CODE",
+	}
+	tc := newTestCollector()
+
+	isNoErr(t, ParseWithOptions(&cfg1, Options{TagName: "json", Collector: tc}))
+	isEqual(t, "VALUE7", tc.Map["KEY1"][0].EnvValue)
+	isEqual(t, "CODE", tc.Map["KEY1"][0].CodeValue)
 }
 
 func TestParsesEnvInner(t *testing.T) {
@@ -585,6 +794,15 @@ func TestParsesEnvInner(t *testing.T) {
 	isNoErr(t, Parse(&cfg))
 	isEqual(t, "someinnervalue", cfg.InnerStruct.Inner)
 	isEqual(t, uint(8), cfg.InnerStruct.Number)
+
+	cfg1 := ParentStruct{
+		InnerStruct: &InnerStruct{Number: 42},
+	}
+	tc := newTestCollector()
+
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+	isEqual(t, "8", tc.Map["innernum"][0].EnvValue)
+	isEqual(t, "42", tc.Map["innernum"][0].CodeValue)
 }
 
 func TestParsesEnvInnerFails(t *testing.T) {
@@ -615,6 +833,13 @@ func TestParsesEnvInnerFailsMultipleErrors(t *testing.T) {
 	isTrue(t, errors.Is(err, ParseError{}))
 	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
 	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+
+	tc := newTestCollector()
+	err = ParseWithOptions(&config{}, Options{Collector: tc})
+	isTrue(t, errors.Is(err, ParseError{}))
+	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, tc.Map["NAME"][0].Required)
 }
 
 func TestParsesEnvInnerNil(t *testing.T) {
@@ -638,6 +863,11 @@ func TestParsesEnvNested(t *testing.T) {
 	var cfg ForNestedStruct
 	isNoErr(t, Parse(&cfg))
 	isEqual(t, "somenestedvalue", cfg.NestedVar)
+
+	var cfg1 ForNestedStruct
+	tc := newTestCollector()
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+	isEqual(t, "somenestedvalue", tc.Map["nestedvar"][0].EnvValue)
 }
 
 func TestEmptyVars(t *testing.T) {
@@ -871,6 +1101,12 @@ func TestErrorRequiredWithDefault(t *testing.T) {
 	t.Setenv("IS_REQUIRED", "")
 	isNoErr(t, Parse(cfg))
 	isEqual(t, "important", cfg.IsRequired)
+
+	cfg1 := &config{}
+	tc := newTestCollector()
+	isNoErr(t, ParseWithOptions(cfg1, Options{Collector: tc}))
+	isEqual(t, "important", tc.Map["IS_REQUIRED"][0].Default)
+	isTrue(t, tc.Map["IS_REQUIRED"][0].DefaultExist)
 }
 
 func TestErrorRequiredNotSet(t *testing.T) {
@@ -971,6 +1207,14 @@ func TestParseUnsetRequireOptions(t *testing.T) {
 	unset, exists := os.LookupEnv("PASSWORD")
 	isEqual(t, "", unset)
 	isEqual(t, false, exists)
+
+	cfg1 := config{}
+	tc := newTestCollector()
+	t.Setenv("PASSWORD", "superSecret")
+	isNoErr(t, ParseWithOptions(&cfg1, Options{Collector: tc}))
+
+	isEqual(t, "superSecret", tc.Map["PASSWORD"][0].EnvValue)
+	isTrue(t, tc.Map["PASSWORD"][0].Unset)
 }
 
 func TestCustomParser(t *testing.T) {
@@ -1372,6 +1616,27 @@ func TestIgnoresUnexported(t *testing.T) {
 	isNoErr(t, Parse(&cfg))
 	isEqual(t, cfg.home, "")
 	isEqual(t, "/tmp/fakehome", cfg.Home2)
+}
+
+func TestGlobalCollector(t *testing.T) {
+	type config struct {
+		MapStringString map[string]string `env:"MAP_STRING_STRING" envSeparator:","`
+	}
+
+	t.Setenv("MAP_STRING_STRING", "k1,k2:v2")
+
+	var cfg config
+	err := Parse(&cfg)
+	isTrue(t, errors.Is(err, ParseError{}))
+
+	cfg1 := config{}
+	tc := newTestCollector()
+
+	DefaultCollector = tc
+
+	err = Parse(&cfg1)
+	isTrue(t, errors.Is(err, ParseError{}))
+	isEqual(t, 1, len(tc.Map["MAP_STRING_STRING"]))
 }
 
 type LogLevel int8
